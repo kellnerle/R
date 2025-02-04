@@ -1,0 +1,230 @@
+---
+title: "Assignment 1"
+author: "Lance Kellner"
+date: "2025-01-30"
+output: html_document
+---
+# Vectors
+vec1 <- (2^(2:25))/(2:25)
+print(vec1)
+
+#1.2 Random Integers
+set.seed(50)
+x <- sample(0:999, 250, replace = TRUE)
+y <- sample(0:999, 250, replace = TRUE)
+
+# create vector y2-x1...
+vec2a <- y[2:length(y)] - x[1:(length(x)-1)]
+
+#create vector (sin(y1)/cos(x2)...
+vec2b <- sin(y[1:(length(y)-1)])/cos(x[2:length(x)])
+
+# ceate vector (x1 + 2 x 2 - x3, etc ..)
+vec2c <- x[1:(length(x)-2)] + 2*x[2:(length(x)-1)] - x[3:length(x)]
+
+#1.3 Statistical Functions
+# create a vector (|x1-mean(x)|^1/2, etc...)
+vec3a <- sqrt(abs(x - mean(x)))
+
+#count values in y greater than 200
+sum(y > 200)
+
+# Sort x based on y
+sorted_x <- x[order(y)]
+
+# Select entries in x less than 300 and greater than 600
+filtered_x <- x[x < 300 | x > 600]
+
+#2. Matrices
+#2.1 Working with a random matrix
+
+set.seed(75)
+A <- matrix(sample(10, size = 60, replace = TRUE), nrow = 6)
+
+# Find column and row sums
+row_sums <- apply(A, 1, sum)
+col_sums <- apply(A, 2, sum)
+
+# Find rows with totals > 50
+rows_gt_50 <- which(row_sums > 50)
+
+# Find rows with exactly two 7s
+rows_2_7s <- which(apply(A == 7, 1, sum) == 2)
+
+# Count entries > 4 in each row
+entries_gt_4 <- apply(A > 4, 1, sum)
+
+# Russian Roulette Simulation
+russian_roulette <- function() {
+  sample(c("BANG", rep("CLICK", 5)), 1)
+}
+
+# Function Definition for piecewise function
+fun5 <- function(x){
+  ifelse(x < 0,
+         x^2 + 2*x +3,
+         ifelse(x < 2,
+                x + 3,
+                x^2 + 4*x - 7))
+}
+
+# Plot the function
+x <- seq(-3, 3, by = 0.1)
+plot(x, fun5(x), type = "l", main = "Piecewise Function")
+
+# Conditions with sqrt
+set.seed(2)
+d <- sample(-10:10, 10, replace = TRUE)
+# sqrt_d <- ifelse(d >= 0, sqrt(d), NA) #received warning - in sqrt(d) : NaNs produced
+
+# Loops
+# Sqrt with for loop
+sqrt_d_loop <- numeric(length(d))
+for(i in 1:length(d)) {
+  if(d[i] >= 0) {
+    sqrt_d_loop[i] <- sqrt(d[i])
+  } else {
+    sqrt_d_loop[i] <- NA
+  }
+}
+
+# Normal distribution loop
+means <- numeric(100)
+sds <- numeric(100)
+for(i in 1:100) {
+  samples <- rnorm(1000)
+  means[i] <- mean(samples)
+  sds[i] <- sd(samples)
+}
+
+# Convert indicator variables in mtcars
+data(mtcars)
+mtcars_modified <- mtcars
+for(col in names(mtcars)) {
+  if(length(unique(mtcars[[col]])) < 5) {
+    mtcars_modified[[col]] <- as.factor(mtcars[[col]])
+  }
+}
+
+# Part B: Predictions With lm()
+
+# 1 Regression
+# Download and prepare data
+autompg <- read.table("http://archive.ics.uci.edu/ml/machine-learning-databases/auto-mpg/auto-mpg.data",
+                      quote = "\"", comment.char = "", stringsAsFactors = FALSE)
+
+# Rename columns
+colnames(autompg) <- c("mpg", "cylinders", "displacement", "horsepower", "weight", "acceleration", "model_year", "origin", "car_name")
+
+# Fix data types
+autompg$horsepower[autompg$horsepower == "?"] <- NA  # Replace '?' with NA before converting
+autompg$horsepower <- as.numeric(autompg$horsepower) # Convert to numeric
+autompg$origin <- as.factor(autompg$origin)
+autompg$car_name <- as.factor(autompg$car_name)
+
+# Remove NAs
+autompg_clean <- autompg[complete.cases(autompg), ]
+
+# Create model and calculate training RMSPE
+model1 <- lm(mpg ~ cylinders + displacement + horsepower + weight + acceleration + model_year + origin, data = autompg_clean)
+
+# Predict on training data
+train_predictions <- predict(model1, newdata = autompg_clean)
+
+# Compute RMSPE correctly
+train_rmspe <- sqrt(mean(((autompg_clean$mpg - train_predictions) / autompg_clean$mpg)^2))
+print(paste("Training RMSPE:", train_rmspe))
+
+# Split data and calculate test RMSPE
+set.seed(123)
+train_index <- sample(1:nrow(autompg_clean), 0.7 * nrow(autompg_clean))
+train_data <- autompg_clean[train_index, ]
+test_data <- autompg_clean[-train_index, ]
+
+# Train new model
+model_train <- lm(mpg ~ cylinders + displacement + horsepower + weight + acceleration + model_year + origin, data = train_data)
+
+# Predict on test set
+test_predictions <- predict(model_train, newdata = test_data)
+
+# Compute test RMSPE
+test_rmspe <- sqrt(mean(((test_data$mpg - test_predictions) / test_data$mpg)^2))
+print(paste("Test RMSPE:", test_rmspe))
+
+# Loop to calculate test RMSPE 1000 times
+set.seed(123)
+rmspe_values <- numeric(1000)
+
+for (i in 1:1000) {
+  train_index <- sample(1:nrow(autompg_clean), 0.7 * nrow(autompg_clean))
+  train_data <- autompg_clean[train_index, ]
+  test_data <- autompg_clean[-train_index, ]
+  
+  model_iter <- lm(mpg ~ cylinders + displacement + horsepower + weight + acceleration + model_year + origin, data = train_data)
+  test_predictions <- predict(model_iter, newdata = test_data)
+  
+  rmspe_values[i] <- sqrt(mean(((test_data$mpg - test_predictions) / test_data$mpg)^2))
+}
+
+# Plot RMSPE distribution
+hist(rmspe_values, breaks = 30, main = "Distribution of Test RMSPE", xlab = "RMSPE", col = "blue")
+
+# Part 2: Classification with Spam Dataset
+
+# Load necessary library
+library(kernlab)
+data("spam")
+
+# Convert outcome variable to binary numeric (1 = spam, 0 = nonspam)
+spam$type <- ifelse(spam$type == "spam", 1, 0)
+
+# Check structure
+str(spam)
+
+# Split data into training and test (80:20)
+set.seed(123)  # For reproducibility
+train_index <- sample(1:nrow(spam), 0.8 * nrow(spam))
+train_data <- spam[train_index, ]
+test_data <- spam[-train_index, ]
+
+# Train the LPM
+# Fit LPM model using lm()
+lpm_model <- lm(type ~ ., data = train_data)
+
+# Predict probabilities on test set
+test_predictions <- predict(lpm_model, newdata = test_data)
+
+# Convert probabilities into binary predictions (threshold = 0.5)
+test_pred_class <- ifelse(test_predictions > 0.5, 1, 0)
+
+# Compute confusion matrix
+# Create confusion matrix
+conf_matrix <- table(Predicted = test_pred_class, Actual = test_data$type)
+print(conf_matrix)
+
+# Compute Accuracy
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+print(paste("Test Accuracy:", accuracy))
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
