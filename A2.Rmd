@@ -1,0 +1,304 @@
+---
+title: "Assignment 2"
+author: "Lance Kellner"
+date: "2025-02-04"
+output: html_document
+---
+library(tidyverse)
+library(corrplot)
+library(caret)
+library(stats)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+data <- read.csv("C:/Users/kelln/OneDrive/Desktop/Machine Learning Course/ConsumerSurvey.csv")
+
+### Inspect Data
+str(data)
+head(data)
+summary(data)
+
+### Data Pre Processing
+### Check for missing values
+missing_values <- colSums(is.na(data))
+print("Missing values in each column:")
+print(missing_values)
+
+### Convert Categorical Variables to Factors
+data$V1 <- as.factor(data$V1)
+data$V2 <- as.factor(data$V2)
+data$V3 <- as.factor(data$V3)
+data$target <- as.factor(data$target)
+
+### Exploratory Data Analysis
+### Distribution of target variable
+ggplot(data, aes(x = target)) +
+  geom_bar() +
+  labs(title = "Distribution of Purchase Likelihood",
+       x = "Purchase Likelihood",
+       y = "Count")
+
+### Box plots for continuous variables by target
+continuous_vars <- c("V4", "V5", "V6", "V7", "V8", "V9", "V10", 
+                     "V11", "V12", "V13", "V14")
+
+for(var in continuous_vars) {
+  plot <- ggplot(data, aes_string(x = "target", y = var)) +
+   geom_boxplot() +
+    labs(title = paste("Distribution of", var, "by Target"),
+         x = "Purchase Likelihood",
+         y = var)
+  print(plot)
+}
+
+### This for loop above gave me quite a bit of difficuly. Initially I had the
+### continuous_vars called out as "v4, v5, v6" and so on. I was getting an error
+### and used Claude to help me rectify it. It turns out that each individual 
+### variable needed its own " ". Every day is a school day.
+
+### Correlation Analysis
+### Select only numeric columns
+numeric_data <- data[, sapply(data, is.numeric)]
+
+### Calculate correlation matrix
+correlation_matrix <- cor(numeric_data)
+### This code gave me a warning message that the STD is zero. Upon further review
+### I checked the data and found that V10 had a STD of 0 because all values were 
+### the same. V10 is financial literacy score. I considered whether to drop this 
+### variable or keep it and decided to proceed with caution. May revisit this 
+### decision later in the assignment and see what type of impact dropping it has
+
+### Plot correlation matrix
+corrplot(correlation_matrix,
+         method = "color",
+         type = "upper",
+         tl.cex = 0.7,
+         title = "Correlation Matrix of Numeric Variables")
+
+### Prediction using LPM and Logistic Regression
+### Convert target variable to numeric for LPM
+target_numeric <- as.numeric(as.character(data$target))
+
+### Prepare formula for models
+model_vars <- paste(continuous_vars, collapse = " + ")
+formula_str <- paste("target_numeric ~", model_vars)
+formula_obj <- as.formula(formula_str)
+
+### Fit Linear Probability Model
+lpm_model <- lm(formula_obj, data = data)
+lpm_predictions <- predict(lpm_model)
+lpm_binary <- ifelse(lpm_predictions > 0.5, 1, 0)
+
+### Fit Logistic Regression
+formula_logit <- as.formula(paste("target ~", model_vars))
+logit_model <- glm(formula_logit, data = data, family = "binomial")
+logit_predictions <- predict(logit_model, type = "response")
+logit_binary <- ifelse(logit_predictions > 0.5, 1, 0)
+
+### Calculate the accuracy for both models
+lpm_accuracy <- mean(lpm_binary == as.numeric(as.character(data$target)))
+logit_accuracy <- mean(logit_binary == as.numeric(as.character(data$target)))
+
+print(paste("LPM Accuracy:", round(lpm_accuracy, 4))) #0.8525
+print(paste("Logit Accuracy:", round(logit_accuracy, 4))) #0.8801
+
+### Finding Optimal Threshold for LPM
+### Function to calculate accuracy for different thresholds
+calculate_accuracy <- function(predictions, actual, threshold) {
+  binary_pred <- ifelse(predictions >threshold, 1, 0)
+  mean(binary_pred == actual)
+}
+
+### Test different thresholds
+thresholds <- seq(0.1, 0.9, by = 0.1)
+lpm_accuracies <- sapply(thresholds, function(thresh) {
+  calculate_accuracy(lpm_predictions, as.numeric(as.character(data$target)), thresh)
+})
+
+### Find optimal threshold for LPM
+optimal_threshold_lpm <- thresholds[which.max(lpm_accuracies)]
+print(paste("Optimal LPM threshold:", optimal_threshold_lpm)) #0.4
+
+### Create confusion matrix for LPM with optimal threshold
+lpm_pred_optimal <- ifelse(lpm_predictions > optimal_threshold_lpm, 1, 0)
+lpm_conf_matrix <- table(Predicted = lpm_pred_optimal,
+                         Actual = as.numeric(as.character(data$target)))
+print("LPM Confusion Matrix:")
+print(lpm_conf_matrix)
+
+### Finding the optimal threshold for Logistic Regression
+### Test different thresholds for Logistic Regression
+logit_accuracies <- sapply(thresholds, function(thresh) {
+  calculate_accuracy(logit_predictions, as.numeric(as.character(data$target)), thresh)
+})
+
+### Find optimal threshold for logistic regression
+optimal_threshold_logit <- thresholds[which.max(logit_accuracies)]
+print(paste("Optimal Logit threshold:", optimal_threshold_logit)) #0.4
+
+### Create confusion matrix for logistic regression with optimal threshold
+logit_pred_optimal <- ifelse(logit_predictions > optimal_threshold_logit, 1, 0)
+logit_conf_matrix <- table(Predicted = logit_pred_optimal,
+                           Actual = as.numeric(as.character(data$target)))
+print("Logistic Regression Confusion Matrix:")
+print(logit_conf_matrix)
+
+### Comparison of LPM and Logit Confusion Matrixes
+
+### Logistic Regression Confusion Matrix Analysis
+logit_TP = 6217     # True Positives (correctly predicted 1s)
+logit_TN = 37883    # True Negatives (correctly predicted 0s)
+logit_FP = 2117     # False Positives (incorrectly predicted 1s)
+logit_FN = 3783     # False Negatives (incorrectly predicted 0s)
+
+### LPM Confusion Matrix Analysis
+lpm_TP = 5306       # True Positives
+lpm_TN = 38145      # True Negatives
+lpm_FP = 1855       # False Positives
+lpm_FN = 4694       # False Negatives
+
+### Calculate metrics for both models
+### Logistic Regression Metrics
+logit_total = logit_TP + logit_TN + logit_FP + logit_FN
+logit_accuracy = (logit_TP + logit_TN)/logit_total
+logit_precision = logit_TP/(logit_TP + logit_FP)
+logit_recall = logit_TP/(logit_TP + logit_FN)
+logit_f1 = 2 * (logit_precision * logit_recall)/(logit_precision + logit_recall)
+
+### LPM Metrics
+lpm_total = lpm_TP + lpm_TN + lpm_FP + lpm_FN
+lpm_accuracy = (lpm_TP + lpm_TN)/lpm_total
+lpm_precision = lpm_TP/(lpm_TP + lpm_FP)
+lpm_recall = lpm_TP/(lpm_TP + lpm_FN)
+lpm_f1 = 2 * (lpm_precision * lpm_recall)/(lpm_precision + lpm_recall)
+
+### Print comparative results
+print("Logistic Regression Metrics:")
+print(paste("Accuracy:", round(logit_accuracy, 4)))
+print(paste("Precision:", round(logit_precision, 4)))
+print(paste("Recall:", round(logit_recall, 4)))
+print(paste("F1 Score:", round(logit_f1, 4)))
+
+print("\nLPM Metrics:")
+print(paste("Accuracy:", round(lpm_accuracy, 4)))
+print(paste("Precision:", round(lpm_precision, 4)))
+print(paste("Recall:", round(lpm_recall, 4)))
+print(paste("F1 Score:", round(lpm_f1, 4)))
+
+print("\nComparative Analysis:")
+print(paste("Difference in True Positives (Logit - LPM):", logit_TP - lpm_TP))
+print(paste("Difference in True Negatives (Logit - LPM):", logit_TN - lpm_TN))
+print(paste("Difference in False Positives (Logit - LPM):", logit_FP - lpm_FP))
+print(paste("Difference in False Negatives (Logit - LPM):", logit_FN - lpm_FN))
+
+### The results of the analysis show that the logistic regression model predicts
+### more conservative approach and predicts more negative cases.
+### Overall, prediction accuracy is higher for the Logit model, at 88.2%, compared
+### to 86.9% by the LPM.
+### Logit identified 911 more true positives than LPM, and LPM identified 262 more
+### true negatives than Logit.
+### The appropriate model to use must then depend on the specific business case;
+### If minimizing false positives is priority, choose LPM.
+### If maximizing true positives is priority, choose Logit - perhaps identifying 
+### potential purchasers of a product
+### Further, for more balanced performance, Logit may be the better choice.
+### Confusion Matrix is an appropriate name for these tables. My head hurts a bit.
+
+### Multiple runs of the models
+### Create a function to perform one run of both models
+perform_model_run <- function(train_indices) {
+  # Split data into train and test
+  train_data <- data[train_indices, ]
+  test_data <- data[-train_indices, ]
+  
+  # Fit LPM on training data
+  lpm_model <- lm(formula_obj, data = train_data)
+  lpm_pred <- predict(lpm_model, newdata = test_data)
+  lpm_pred_binary <- ifelse(lpm_pred > optimal_threshold_lpm, 1, 0)
+  # Compare the predictions on test_data
+  lpm_acc <- mean(lpm_pred_binary == as.numeric(as.character(test_data$target)))
+  
+  # Fit Logistic Regression on training data
+  logit_model <- glm(formula_logit, data = train_data, family = "binomial")
+  logit_pred <- predict(logit_model, newdata = test_data, type = "response")
+  logit_pred_binary <- ifelse(logit_pred > optimal_threshold_logit, 1, 0)
+  logit_acc <- mean(logit_pred_binary == as.numeric(as.character(test_data$target)))
+  
+  return(c(lpm_acc, logit_acc))
+}
+
+### Multiple runs of the models
+### Create a function to perform one run of both models
+perform_model_run <- function(train_indices) {
+  ### Split data into train and test
+  train_data <- data[train_indices, ]
+  test_data <- data[-train_indices, ]
+  
+  ### Fit LPM on training data
+  lpm_model <- lm(formula_obj, data = train_data)
+  lpm_pred <- predict(lpm_model, newdata = test_data)
+  lpm_pred_binary <- ifelse(lpm_pred > optimal_threshold_lpm, 1, 0)
+  lpm_acc <- mean(lpm_pred_binary == as.numeric(as.character(test_data$target)))
+  
+  ### Fit Logistic Regression on training data
+  logit_model <- glm(formula_logit, data = train_data, family = "binomial")
+  logit_pred <- predict(logit_model, newdata = test_data, type = "response")
+  logit_pred_binary <- ifelse(logit_pred > optimal_threshold_logit, 1, 0)
+  logit_acc <- mean(logit_pred_binary == as.numeric(as.character(test_data$target)))
+  
+  return(c(lpm_acc, logit_acc))
+}
+
+### Perform multiple runs
+set.seed(123)
+n_runs <- 10
+results <- matrix(NA, nrow = n_runs, ncol = 2)
+
+for(i in 1:n_runs) {
+  ### Create train indices (80% of data)
+  train_indices <- sample(1:nrow(data), size = 0.8 * nrow(data))
+  results[i,] <- perform_model_run(train_indices)
+}
+
+### Calculate summary statistics
+mean_accuracies <- colMeans(results)
+sd_accuracies <- apply(results, 2, sd)
+ci_lower <- mean_accuracies - 1.96 * sd_accuracies/sqrt(n_runs)
+ci_upper <- mean_accuracies + 1.96 * sd_accuracies/sqrt(n_runs)
+
+print("Multiple Runs Results:")
+print(paste("LPM Mean Accuracy:", round(mean_accuracies[1], 4))) 
+print(paste("LPM 95% CI:", round(ci_lower[1], 4), "-", round(ci_upper[1], 4)))
+print(paste("Logistic Mean Accuracy:", round(mean_accuracies[2], 4)))
+print(paste("Logistic 95% CI:", round(ci_lower[2], 4), "-", round(ci_upper[2], 4)))
+
+
+### Identify the most important variables using LPM
+### Get coefficients from LPM Model
+lpm_coef <- summary(lpm_model)$coefficients
+lpm_importance <- data.frame(
+  Variable = rownames(lpm_coef),
+  Coefficient = lpm_coef[,1],
+  P_Value = lpm_coef[,4]
+)
+
+### Sort by absolute coefficient value
+lpm_importance$Abs_Coefficient <- abs(lpm_importance$Coefficient)
+lpm_importance <- lpm_importance[order(-lpm_importance$Abs_Coefficient),]
+
+### Print top variables
+print("Top Variables from LPM:")
+print(lpm_importance[1:5,])
+
+### Visualize variable importance
+ggplot(lpm_importance[-1,], aes(x = reorder(Variable, Abs_Coefficient), y = Coefficient)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Variable Importance in LPM",
+       x = "Variables",
+       y = "Coefficient Value") +
+  theme_minimal()
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
