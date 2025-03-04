@@ -1,0 +1,827 @@
+## Load required packages
+
+```{r load-packages}
+library(rpart)
+library(randomForest)
+library(pROC)
+library(ggplot2)
+library(dplyr)
+library(caret)
+library(parallel)
+library(doParallel)
+
+# Set seed for reproducibility
+set.seed(123)
+```
+## Loading data
+
+```{r load-data}
+library(AmesHousing)
+ames <- make_ames()
+
+str(ames, list.len = 10)
+```
+
+# Part 1: Classification
+
+First we will examine the data structure, handle missing values, and check factors for categories with less than 10 obs
+
+## Pre Processing
+
+```{r classification-preprocessing}
+# Check for missing values
+na_count <- colSums(is.na(ames))
+print("Columns with missing values:")
+print(na_count[na_count > 0])
+
+# Handle missing values
+# For numeric variables with NA, impute with median
+numeric_cols <- names(ames)[sapply(ames, is.numeric)]
+for (col in numeric_cols) {
+  if(any(is.na(ames[[col]]))) {
+    cat("Imputing missing values for", col, "\n")
+    ames[[col]][is.na(ames[[col]])] <- median(ames[[col]], na.rm = TRUE)
+  }
+}
+
+# For categorical vars with NA, impute with mode
+categorical_cols <- names(ames)[sapply(ames, is.factor)]
+for (col in categorical_cols) {
+  if (any(is.na(ames[[col]]))) {
+    mode_val <- names(sort(table(ames[[col]]), decreasing = TRUE))[1]
+    cat("Imputing missing values for", col, "with mode:", mode_val, "\n")
+    ames[[col]][is.na(ames[[col]])] <- mode_val
+  }
+}
+
+# Check factors with less than 10 obs in any category
+low_count_factors <- list()
+for (col in categorical_cols) {
+  counts <- table(ames[[col]])
+  low_cats <- names(counts[counts < 10])
+  if (length(low_cats) > 0) {
+    low_count_factors[[col]] <- low_cats
+  }
+}
+
+# Print the factors with low counts
+print("Factors with categories having less than 10 observations:")
+print(low_count_factors)
+
+# Remove observations in categories with less than 10 observations
+rows_before <- nrow(ames)
+for (col in names(low_count_factors)) {
+  ames <- ames[!(ames[[col]] %in% low_count_factors[[col]]), ]
+}
+rows_after <- nrow(ames)
+cat("Removed", rows_before - rows_after, "observations with rare categories\n")
+
+# Create the bindary variable "expensive" for classification (1 if above 75th percentile)
+q75 <- quantile(ames$Sale_Price, 0.75)
+ames$expensive <- as.factor(ifelse(ames$Sale_Price > q75, 1, 0))
+
+# Check class distribution
+table(ames$expensive)
+```
+## Split data into training and test sets
+
+```{r split-data}
+# Create indices for train/test split (80 20)
+train_idx <- createDataPartition(ames$expensive, p=0.8, list = FALSE)
+train_data <- ames[train_idx, ]
+test_data <- ames[-train_idx, ]
+
+# Create formulas for prediction (excluding Sale_Price)
+predictors <- setdiff(names(ames), c("Sale_Price", "expensive"))
+class_formula <- as.formula(paste("expensive ~", paste(predictors, collapse = " + ")))
+reg_formula <- as.formula(paste("Sale_Price ~", paste(predictors, collapse = " + ")))
+```
+
+## Implementing bagging for classification
+
+```{r bagging-classification-function}
+
+# Function to perform bagging for classification using rpart
+bagging_classification <- function(data, formula, ntree = 100, test_data = NULL) {
+  n <- nrow(data)
+  trees <- list()
+  oob_preds <- matrix(NA, nrow = n, ncol = 2)
+  
+  # Initialize variables to store OOB predictions
+  oob_votes <- matrix(0, nrow = n, ncol = 2)
+  oob_counts <- rep(0, n)
+  
+  # Train the ensemble
+  for (i in 1:ntree) {
+    # Bootstrap sample
+    boot_idx <- sample(1:n, n, replace = TRUE)
+    boot_data <- data[boot_idx, ]
+    
+    # OOB indices (observations not included in bootstrap sample)
+    oob_idx <- setdiff(1:n, unique(boot_idx))
+    
+    # Fit decision tree
+    tree <- rpart(formula, data = boot_data, method = "class")
+    trees[[i]] <- tree
+    
+    # OOB predictions
+    if (length(oob_idx) > 0) {
+      oob_pred <- predict(tree, data[oob_idx, ], type = "prob")
+      # Check dimensions to ensure proper assignment
+      if (!is.null(dim(oob_pred)) && ncol(oob_pred) == 2) {
+        oob_votes[oob_idx, ] <- oob_votes[oob_idx, ] + oob_pred
+        oob_counts[oob_idx] <- oob_counts[oob_idx] + 1
+      }
+    }
+  }
+  
+  # Calculate final OOB predictions
+  for (i in 1:n) {
+    if (oob_counts[i] > 0) {
+      oob_preds[i, ] <- oob_votes[i, ] / oob_counts[i]
+    }
+  }
+  
+  # Make OOB class predictions
+  oob_class <- factor(ifelse(oob_preds[, 2] > 0.5, 1, 0), levels = c(0, 1))
+  
+  # Test predictions if test data is provided
+  test_preds <- NULL
+  if (!is.null(test_data)) {
+    test_probs <- matrix(0, nrow = nrow(test_data), ncol = 2)
+    
+    for (tree in trees) {
+      tree_pred <- predict(tree, test_data, type = "prob")
+      test_probs <- test_probs + tree_pred
+    }
+    
+    test_probs <- test_probs / ntree
+    test_preds <- factor(ifelse(test_probs[, 2] > 0.5, 1, 0), levels = c(0, 1))
+  }
+  
+  # Return results
+  result <- list(
+    trees = trees,
+    oob_preds = oob_preds,
+    oob_class = oob_class,
+    test_preds = test_preds
+  )
+  
+  return(result)
+}
+```
+
+## Apply the models: bagging and random forest for classification
+
+```{r apply-classification-models}
+# Set seed for reproducibility
+set.seed(456)
+
+# Apply bagging for classification
+cat("Applying bagging for classification...\n")
+bagging_class <- bagging_classification(train_data, class_formula, ntree = 100)
+
+# Apply random forest for classification
+cat("Applying random forest for classification...\n")
+rf_class <- randomForest(class_formula, data = train_data, ntree = 100,
+                         importance = TRUE, localImp = TRUE)
+
+# Calculate OOB Confusion Tables
+# Bagging confusion table
+bagging_conf <- table(train_data$expensive, bagging_class$oob_class)
+cat("Bagging OOB Confusion Table:\n")
+print(bagging_conf)
+
+# Random Forest OOB Confusion Table
+cat("Random Forest OOB Confusion Table\n")
+print(rf_class$confusion)
+
+# Calculate OOB AUC for Bagging:
+bagging_oob_auc <- roc(train_data$expensive, bagging_class$oob_preds[, 2])$auc
+cat("Bagging OOB AUC:", bagging_oob_auc, "\n")
+
+# Calculate OOB AUC for Random Forest:
+rf_oob_probs <- predict(rf_class, type = "prob")[, 2] # Probability of class 1
+rf_oob_auc <- roc(train_data$expensive, rf_oob_probs)$auc
+cat("Random Forest OOB AUC:", rf_oob_auc, "\n")
+
+# Determine which model is better based on OOB AUC
+cat("Based on OOB AUC, the better model is:",
+    ifelse(bagging_oob_auc > rf_oob_auc, "Bagging", "Random Forest"), "\n")
+```
+
+## Evaluate Random Forest on Multiple Test Sets
+
+```{r rf-multiple-tests}
+# Function to evaluate Random Forest on a test set
+evaluate_rf_class <- function(seed){
+  set.seed(seed)
+  
+  # Create train/test split
+  train_idx <- createDataPartition(ames$expensive, p = 0.8, list = FALSE)
+  train <- ames[train_idx, ]
+  test <- ames[-train_idx, ]
+  
+  # Train Random Forest
+  rf <- randomForest(class_formula, data = train, ntree = 100)
+  
+  # Predict on test set
+  test_preds <- predict(rf, test, type = "prob")[, 2]
+  
+  # Calculate AUC
+  auc <- roc(test$expensive, test_preds)$auc
+  
+  return(auc)
+}
+
+# Run RF on multiple test sets
+set.seed(789)
+n_tests <- 100
+seeds <- sample(1:10000, n_tests)
+
+# Set up parallel processing
+num_cores <- detectCores() - 1
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+# Export any necessary packages and objects to the workers
+clusterEvalQ(cl, {
+  library(randomForest)
+  library(caret)
+  library(pROC)
+  library(dplyr)
+})
+
+# Export functions and data to all worker nodes
+clusterExport(cl, c("evaluate_rf_class", "ames", "class_formula", "predictors"))
+
+# Evaluate RF on multiple test sets
+cat("Evaluating Random Forest on", n_tests, "test sets...\n")
+rf_test_aucs <- foreach(i = seeds, .combine = c) %dopar% {
+  evaluate_rf_class(i)
+}
+
+stopCluster(cl)
+
+# Calculate mean and 95% CI
+rf_test_mean_auc <- mean(rf_test_aucs)
+rf_test_ci <- quantile(rf_test_aucs, c(0.025, 0.975))
+
+cat("Random Forest Test AUC (mean):", rf_test_mean_auc, "\n")
+# Random Forest Test AUC (mean): 0.9858764
+# This is the same value as the OOB Area Under the Curve.
+cat("Random Forest Test AUC (95% CI):", rf_test_ci[1], "-", rf_test_ci[2], "\n")
+# Random Forest Test AUC (95% CI): 0.9775959 - 0.9920707 
+
+# Compare OOB AUC with Test AUC
+cat("Difference between OOB AUC and mean Test AUC:", rf_oob_auc - rf_test_mean_auc, "\n")
+```
+## Plot Results with 95% CI
+
+```{r plot-rf-auc}
+# Plot the distribution of test AUCs with 95% CI
+ggplot(data.frame(AUC = rf_test_aucs), aes(x = AUC)) +
+  geom_histogram(bins = 20, fill = "skyblue", color = "black") +
+  geom_vline(xintercept = rf_test_mean_auc, color = "red", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = rf_test_ci[1], color = "blue", linetype = "dotted", size = 1) +
+  geom_vline(xintercept = rf_test_ci[2], color = "blue", linetype = "dotted", size = 1) +
+  labs(title = "Distribution of Random Forest Test AUCs",
+       subtitle = paste("Mean:", round(rf_test_mean_auc, 4),
+                        "95% CI: [", round(rf_test_ci[1], 4), "-", round(rf_test_ci[2], 4), "]"),
+       x = "AUC", y = "Frequency") +
+  theme_minimal()
+```
+## Variable Importance for Random Forest
+
+```{r variable-importance}
+# Report the variable importance for Random Forest (Mean Decrease in Impurity)
+cat("Variable Importance for Random Forest (MDI):\n")
+importance_mdi <- importance(rf_class, type = 1)
+importance_df_mdi <- data.frame(
+  Variable = rownames(importance_mdi),
+  Importance = importance_mdi[, ncol(importance_mdi)]  # Use the last column
+)
+importance_df_mdi <- importance_df_mdi[order(-importance_df_mdi$Importance), ]
+print(head(importance_df_mdi, 10))
+
+# Plot Variable Importance (MDI)
+ggplot(head(importance_df_mdi, 20), aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  coord_flip() +
+  labs(title = "Random Forest Variable Importance (MDI)",
+       x = "Variable", y = "Importance (Mean Decrease in Gini)") +
+  theme_minimal()
+
+# Report variable importance for Random Forest (MDA - Mean Decrease in Accuracy)
+cat("Variable Importance for Random Forest (Mean Decrease in Accuracy:\n")
+importance_mda <- importance(rf_class, type = 2)
+accuracy_col <- grep("Accuracy|accuracy", colnames(importance_mda), value = TRUE)
+
+if (length(accuracy_col) > 0) {
+  # Found a column with "Accuracy" in the name
+  importance_df_mda <- data.frame(
+    Variable = rownames(importance_mda),
+    Importance = importance_mda[, accuracy_col[length(accuracy_col)]]  # Use the last matching column
+  )
+} else {
+  # Fallback to the last column
+  importance_df_mda <- data.frame(
+    Variable = rownames(importance_mda),
+    Importance = importance_mda[, ncol(importance_mda)]
+  )
+}
+importance_df_mda <- importance_df_mda[order(-importance_df_mda$Importance), ]
+print(head(importance_df_mda, 10))
+
+# Plot variable importance (MDA)
+ggplot(head(importance_df_mda, 20), aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "lightgreen") +
+  coord_flip() +
+  labs(title = "Random Forest Variable Importance (MDA)",
+       x = "Variable", y = "Importance (Mean Decrease in Accuracy)") +
+  theme_minimal()
+```
+
+## Local Importance
+
+```{r local-importance}
+# Get the most important variable
+most_imp_var <- importance_df_mdi$Variable[1]
+cat("Most important variable (MDI):", most_imp_var, "\n")
+
+# Get local importance for this variable
+local_imp <- rf_class$localImportance[as.character(most_imp_var), ]
+
+# Calculate average local importance by class
+local_imp_by_class <- aggregate(local_imp, by = list(Class = train_data$expensive), FUN = mean)
+print(local_imp_by_class)
+
+# Plot local importance
+local_imp_df <- data.frame(
+  LocalImportance = local_imp,
+  Class = train_data$expensive,
+  Value = train_data[[most_imp_var]]
+)
+
+# If the most important variable is numeric, bin it for visualization
+if (is.numeric(local_imp_df$Value)) {
+  local_imp_df$ValueBin <- cut(local_imp_df$Value, breaks = 10)
+  
+  ggplot(local_imp_df, aes(x = ValueBin, y = LocalImportance, fill = Class)) +
+    geom_boxplot() +
+    labs(title = paste("Local Importance of", most_imp_var),
+         x = most_imp_var, y = "Local Importance") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+} else {
+  # If categorical, plot as is
+  ggplot(local_imp_df, aes(x = Value, y = LocalImportance, fill = Class)) +
+    geom_boxplot() +
+    labs(title = paste("Local Importance of", most_imp_var),
+         x = most_imp_var, y = "Local Importance") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+```
+
+## Compare with LPM
+
+```{r lpm-comparison}
+# Function to evaluate LPM on a test set
+evaluate_lpm <- function(seed) {
+  set.seed(seed)
+  
+  # Create train/test split
+  train_idx <- createDataPartition(ames$expensive, p = 0.8, list = FALSE)
+  train <- ames[train_idx, ]
+  test <- ames[-train_idx, ]
+  
+  # Convert outcome to numeric
+  train$expensive_num <- as.numeric(as.character(train$expensive))
+  test$expensive_num <- as.numeric(as.character(test$expensive))
+  
+  # Identify factors with only one level in training data
+  single_level_factors <- c()
+  for (pred in predictors) {
+    if (is.factor(train[[pred]])) {
+      # Check if this factor has only one level after dropping unused levels
+      if (length(levels(droplevels(train[[pred]]))) < 2) {
+        single_level_factors <- c(single_level_factors, pred)
+      }
+    }
+  }
+  
+  # Remove problematic factors from the predictor list
+  valid_predictors <- setdiff(predictors, single_level_factors)
+  
+  # Create formula with only valid predictors
+  lpm_formula <- as.formula(paste("expensive_num ~", paste(valid_predictors, collapse = " + ")))
+  
+  # Fit the LPM model
+  lpm <- lm(lpm_formula, data = train)
+  
+  # Predict on test set
+  test_preds <- predict(lpm, test)
+  
+  # Clip predictions to [0, 1]
+  test_preds <- pmin(pmax(test_preds, 0), 1)
+  
+  # Calculate AUC
+  auc <- roc(test$expensive, test_preds)$auc
+  
+  return(auc)
+}
+
+# Run LPM on multiple test sets
+set.seed(101)
+n_tests <- 100
+seeds <- sample(1:10000, n_tests)
+
+# Set up parallel processing if available
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+# Export necessary packages and objects to the workers
+clusterEvalQ(cl, {
+  library(caret)
+  library(pROC)
+  library(dplyr)
+})
+
+# Make sure all needed objects are exported to the workers
+clusterExport(cl, c("evaluate_lpm", "ames", "predictors"))
+
+# Evaluate LPM on multiple test sets
+cat("Evaluating LPM on", n_tests, "test sets...\n")
+lpm_test_aucs <- foreach(i = seeds, .combine = c, .packages = c("caret", "pROC")) %dopar% {
+  evaluate_lpm(i)
+}
+
+stopCluster(cl)
+
+# Calculate mean and 95% CI
+lpm_test_mean_auc <- mean(lpm_test_aucs)
+lpm_test_ci <- quantile(lpm_test_aucs, c(0.025, 0.975))
+
+cat("LPM Test AUC (mean):", lpm_test_mean_auc, "\n")
+cat("LPM Test AUC (95% CI):", lpm_test_ci[1], "-", lpm_test_ci[2], "\n")
+
+# Plot comparison of models
+model_comparison <- data.frame(
+  Model = rep(c("Random Forest", "LPM"), each = n_tests),
+  AUC = c(rf_test_aucs, lpm_test_aucs)
+)
+
+ggplot(model_comparison, aes(x = Model, y = AUC, fill = Model)) +
+  geom_boxplot() +
+  labs(title = "Model Comparison - Classification",
+       subtitle = "Based on Test AUC",
+       y = "AUC") +
+  theme_minimal()
+```
+
+# Part 2: Regression
+
+## Implementing Bagging for Regression
+
+```{r bagging-regression-function}
+# Function to perform bagging for regression using rpart
+# Function to perform bagging for regression using rpart with more robust OOB prediction handling
+bagging_regression <- function(data, formula, ntree = 100, test_data = NULL) {
+  n <- nrow(data)
+  trees <- list()
+  
+  # Initialize variables to store OOB predictions
+  oob_sums <- rep(0, n)
+  oob_counts <- rep(0, n)
+  
+  # Train the ensemble
+  for (i in 1:ntree) {
+    # Bootstrap sample
+    boot_idx <- sample(1:n, n, replace = TRUE)
+    boot_data <- data[boot_idx, ]
+    
+    # OOB indices
+    oob_idx <- setdiff(1:n, unique(boot_idx))
+    
+    # Fit tree
+    tree <- rpart(formula, data = boot_data, method = "anova")
+    trees[[i]] <- tree
+    
+    # OOB predictions
+    if (length(oob_idx) > 0) {
+      oob_pred <- predict(tree, data[oob_idx, ])
+      oob_sums[oob_idx] <- oob_sums[oob_idx] + oob_pred
+      oob_counts[oob_idx] <- oob_counts[oob_idx] + 1
+    }
+  }
+  
+  # Calculate final OOB predictions, handling potential zeros in oob_counts
+  oob_preds <- rep(NA, n)
+  for (i in 1:n) {
+    if (oob_counts[i] > 0) {
+      oob_preds[i] <- oob_sums[i] / oob_counts[i]
+    }
+  }
+  
+  # Debug information
+  cat("Number of observations with OOB predictions:", sum(!is.na(oob_preds)), "out of", n, "\n")
+  
+  # If too few OOB predictions, use in-bag predictions as a fallback
+  if (sum(!is.na(oob_preds)) < 0.5 * n) {
+    cat("Warning: Too few OOB predictions. Using in-bag predictions as fallback.\n")
+    # Get predictions for all observations
+    all_preds <- matrix(0, nrow = n, ncol = ntree)
+    
+    for (i in 1:ntree) {
+      all_preds[, i] <- predict(trees[[i]], data)
+    }
+    
+    # Average predictions across all trees
+    oob_preds <- rowMeans(all_preds)
+  }
+  
+  # Test predictions if test data is provided
+  test_preds <- NULL
+  if (!is.null(test_data)) {
+    test_sums <- rep(0, nrow(test_data))
+    
+    for (tree in trees) {
+      tree_pred <- predict(tree, test_data)
+      test_sums <- test_sums + tree_pred
+    }
+    
+    test_preds <- test_sums / ntree
+  }
+  
+  # Return results
+  result <- list(
+    trees = trees,
+    oob_preds = oob_preds,
+    test_preds = test_preds
+  )
+  
+  return(result)
+}
+```
+
+## Apply the Models: Bagging and Random Forest for Regression
+
+```{r apply-regression-models}
+# Set seed for reproducibility
+set.seed(456)
+
+# Apply bagging for regression
+cat("Applying Bagging for Regression...\n")
+bagging_reg <- bagging_regression(train_data, reg_formula, ntree=100)
+
+# Apply Random Forest for Regression
+cat("Applying Random Forest for Regression...\n")
+rf_reg <- randomForest(reg_formula, data = train_data, ntree = 100,
+                       importance = TRUE, localImp = TRUE)
+
+# Calculate the OOB MSPE for Bagging
+bagging_oob_mse <- mean((train_data$Sale_Price - bagging_reg$oob_preds)^2, na.rm = TRUE)
+bagging_oob_rmspe <- sqrt(bagging_oob_mse)
+cat("Bagging OOB RMSPE:", bagging_oob_rmspe, "\n")
+
+# Calculate OOB MSPE for Random Forest
+rf_oob_mse <- mean(rf_reg$mse)
+rf_oob_rmspe <- sqrt(rf_oob_mse)
+cat("Random Forest OOB RMSPE:", rf_oob_rmspe, "\n")
+
+# Determine which model is better based on OOB RMSPE
+cat("Based on OOB RMSPE, the better model is:",
+    ifelse(bagging_oob_rmspe < rf_oob_rmspe, "Bagging", "Random Forest"), "\n")
+```
+
+## Evaluate Random Forest on Multiple Test Sets for Regression
+```{r rf-multiple-tests-regression}
+# Function to evaluate random forest on a test set for regression
+evaluate_rf_reg <- function(seed) {
+  set.seed(seed)
+  
+  # Create train/test split
+  train_idx <- createDataPartition(ames$Sale_Price, p = 0.8, list = FALSE)
+  train <- ames[train_idx, ]
+  test <- ames[-train_idx, ]
+  
+  # Train Random Forest
+  rf <- randomForest(reg_formula, data = train, ntree = 100)
+  
+  # Predict on test set
+  test_preds <- predict(rf, test)
+  
+  # Calculate RMSPE
+  rmspe <- sqrt(mean((test$Sale_Price - test_preds)^2))
+  
+  return(rmspe)
+}
+
+# Run RF on multiple test sets for regression
+set.seed(789)
+n_tests <- 100
+seeds <- sample(1:10000, n_tests)
+
+# Set up parallel processing if available
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+# Export necessary packages and objects to the workers
+clusterEvalQ(cl, {
+  library(randomForest)
+  library(caret)
+  library(dplyr)
+})
+
+# Make sure all needed objects are exported to the workers
+clusterExport(cl, c("evaluate_rf_reg", "ames", "reg_formula", "predictors"))
+
+# Evaluate RF on multiple test sets
+cat("Evaluating Random Forest for regression on", n_tests, "test sets...\n")
+rf_test_rmspes <- foreach(i = seeds, .combine = c) %dopar% {
+  evaluate_rf_reg(i)
+}
+
+stopCluster(cl)
+
+# Calculate mean and 95% CI
+rf_test_mean_rmspe <- mean(rf_test_rmspes)
+rf_test_ci <- quantile(rf_test_rmspes, c(0.025, 0.975))
+
+cat("Random Forest Test RMSPE (mean):", rf_test_mean_rmspe, "\n")
+cat("Random Forest Test RMSPE (95% CI):", rf_test_ci[1], "-", rf_test_ci[2], "\n")
+
+# Compare OOB RMSPE with Test RMSPE
+cat("Difference between OOB RMSPE and mean Test RMSPE:", rf_oob_rmspe - rf_test_mean_rmspe, "\n")
+```
+
+## Plot results for regression
+
+```{r plot-rf-rmspe}
+# Plot the distribution of test RMSPEs with 95% CI
+ggplot(data.frame(RMSPE = rf_test_rmspes), aes(x = RMSPE)) +
+  geom_histogram(bins = 20, fill = "salmon", color = "black") +
+  geom_vline(xintercept = rf_test_mean_rmspe, color = "red", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = rf_test_ci[1], color = "blue", linetype = "dotted", size = 1) +
+  geom_vline(xintercept = rf_test_ci[2], color = "blue", linetype = "dotted", size = 1) +
+  labs(title = "Distribution of Random Forest Test RMSPEs",
+       subtitle = paste("Mean:", round(rf_test_mean_rmspe, 2), 
+                        "95% CI: [", round(rf_test_ci[1], 2), "-", round(rf_test_ci[2], 2), "]"),
+       x = "RMSPE", y = "Frequency") +
+  theme_minimal()
+```
+
+## Variable Importance for Regression
+
+```{r variable-importance-regression}
+# Report variable importance for Random Forest regression
+cat("Variable Importance for Random Forest Regression:\n")
+importance_reg <- importance(rf_reg, type = 1)
+importance_df_reg <- data.frame(
+  Variable = rownames(importance_reg),
+  Importance = importance_reg[, "%IncMSE"]
+)
+importance_df_reg <- importance_df_reg[order(-importance_df_reg$Importance), ]
+print(head(importance_df_reg, 10))
+
+# Plot variable importance
+ggplot(head(importance_df_reg, 20), aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "salmon") +
+  coord_flip() +
+  labs(title = "Random Forest Variable Importance (Regression)",
+       x = "Variable", y = "Importance (% Increase in MSE)") +
+  theme_minimal()
+```
+
+## Local Importance for Regression
+
+```{r local-importance-regression}
+# Get the most important variable for regression
+most_imp_var_reg <- importance_df_reg$Variable[1]
+cat("Most important variable for regression:", most_imp_var_reg, "\n")
+
+# Get local importance for this variable
+local_imp_reg <- rf_reg$localImportance[as.character(most_imp_var_reg), ]
+
+# Create bins for Sale_Price to visualize local importance
+price_bins <- cut(train_data$Sale_Price, breaks = 5)
+
+# Calculate average local importance by price bin
+local_imp_by_price <- aggregate(local_imp_reg, by = list(PriceBin = price_bins), FUN = mean)
+print(local_imp_by_price)
+
+# Plot local importance
+local_imp_reg_df <- data.frame(
+  LocalImportance = local_imp_reg,
+  Price = train_data$Sale_Price,
+  Value = train_data[[most_imp_var_reg]]
+)
+
+# If the most important variable is numeric, bin it for visualization
+if (is.numeric(local_imp_reg_df$Value)) {
+  local_imp_reg_df$ValueBin <- cut(local_imp_reg_df$Value, breaks = 10)
+  
+  ggplot(local_imp_reg_df, aes(x = ValueBin, y = LocalImportance)) +
+    geom_boxplot(fill = "salmon") +
+    labs(title = paste("Local Importance of", most_imp_var_reg, "for Regression"),
+         x = most_imp_var_reg, y = "Local Importance") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+} else {
+  # If categorical, plot as is
+  ggplot(local_imp_reg_df, aes(x = Value, y = LocalImportance)) +
+    geom_boxplot(fill = "salmon") +
+    labs(title = paste("Local Importance of", most_imp_var_reg, "for Regression"),
+         x = most_imp_var_reg, y = "Local Importance") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+```
+
+## Compare with Linear Regression
+
+```{r lm-comparison}
+# Function to evaluate linear regression on a test set
+evaluate_lm <- function(seed) {
+  set.seed(seed)
+  
+  # Create train/test split
+  train_idx <- createDataPartition(ames$Sale_Price, p = 0.8, list = FALSE)
+  train <- ames[train_idx, ]
+  test <- ames[-train_idx, ]
+  
+  # Identify factors with only one level in training data
+  single_level_factors <- c()
+  for (pred in predictors) {
+    if (is.factor(train[[pred]])) {
+      # Check if this factor has only one level after dropping unused levels
+      if (length(levels(droplevels(train[[pred]]))) < 2) {
+        single_level_factors <- c(single_level_factors, pred)
+      }
+    }
+  }
+  
+  # Remove problematic factors from the predictor list
+  valid_predictors <- setdiff(predictors, single_level_factors)
+  
+  # Create formula with only valid predictors
+  modified_reg_formula <- as.formula(paste("Sale_Price ~", paste(valid_predictors, collapse = " + ")))
+  
+  # Train linear regression
+  lm_model <- lm(modified_reg_formula, data = train)
+  
+  # Predict on test set
+  test_preds <- predict(lm_model, test)
+  
+  # Calculate RMSPE
+  rmspe <- sqrt(mean((test$Sale_Price - test_preds)^2))
+  
+  return(rmspe)
+}
+
+# Run LM on multiple test sets
+set.seed(101)
+n_tests <- 100
+seeds <- sample(1:10000, n_tests)
+
+# Set up parallel processing if available
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+# Export necessary packages and objects to the workers
+clusterEvalQ(cl, {
+  library(caret)
+})
+
+# Export the evaluate_lm function and other required objects
+clusterExport(cl, c("evaluate_lm", "ames", "reg_formula"))
+
+# Evaluate LM on multiple test sets
+cat("Evaluating linear regression on", n_tests, "test sets...\n")
+lm_test_rmspes <- foreach(i = seeds, .combine = c) %dopar% {
+  evaluate_lm(i)
+}
+
+stopCluster(cl)
+
+# Calculate mean and 95% CI
+lm_test_mean_rmspe <- mean(lm_test_rmspes)
+lm_test_ci <- quantile(lm_test_rmspes, c(0.025, 0.975))
+
+cat("Linear Regression Test RMSPE (mean):", lm_test_mean_rmspe, "\n")
+cat("Linear Regression Test RMSPE (95% CI):", lm_test_ci[1], "-", lm_test_ci[2], "\n")
+
+# Plot comparison of models for regression
+model_comparison_reg <- data.frame(
+  Model = rep(c("Random Forest", "Linear Regression"), each = n_tests),
+  RMSPE = c(rf_test_rmspes, lm_test_rmspes)
+)
+
+ggplot(model_comparison_reg, aes(x = Model, y = RMSPE, fill = Model)) +
+  geom_boxplot() +
+  labs(title = "Model Comparison - Regression",
+       subtitle = "Based on Test RMSPE",
+       y = "RMSPE") +
+  theme_minimal()
+```
